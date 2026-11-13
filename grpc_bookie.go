@@ -12,20 +12,21 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// GRPCBookie talks to one openledgerd over gRPC.
+// GRPCBookie talks to one openledgerd over gRPC using the Callback API:
+// Async* methods schedule the unary RPC and invoke the completion callback;
+// the blocking [Bookie] methods are thin Sync adapters for existing callers.
 type GRPCBookie struct {
-	client bookiepb.BookieClient
-	conn   *grpc.ClientConn
+	client  bookiepb.BookieClient
+	conn    *grpc.ClientConn
 	timeout time.Duration
 }
 
-// DialBookie connects to an openledgerd Bookie service.
+// DialBookie connects to an openledgerd Bookie service (Callback / async reaction).
 func DialBookie(ctx context.Context, addr string) (*GRPCBookie, error) {
 	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return nil, fmt.Errorf("dial bookie %s: %w", addr, err)
 	}
-	// Touch the connection so dial failures surface before the first RPC when possible.
 	select {
 	case <-ctx.Done():
 		_ = conn.Close()
@@ -47,8 +48,11 @@ func (b *GRPCBookie) Close() error {
 	return b.conn.Close()
 }
 
-func (b *GRPCBookie) ctx() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), b.timeout)
+func (b *GRPCBookie) rpcCtx(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	return context.WithTimeout(parent, b.timeout)
 }
 
 func mapRPC(err error) error {
@@ -118,137 +122,217 @@ func entryFromPB(e *bookiepb.Entry) Entry {
 	}
 }
 
+func (b *GRPCBookie) goRPC(parent context.Context, call func(ctx context.Context) error, done Done) {
+	go func() {
+		ctx, cancel := b.rpcCtx(parent)
+		defer cancel()
+		done(mapRPC(call(ctx)))
+	}()
+}
+
+// --- BookieAsync (Callback API) ---
+
+func (b *GRPCBookie) CreateLedgerAsync(ctx context.Context, ledgerID uint64, masterKey []byte, done Done) {
+	b.goRPC(ctx, func(c context.Context) error {
+		_, err := b.client.CreateLedger(c, &bookiepb.CreateLedgerRequest{
+			LedgerId:  ledgerID,
+			MasterKey: masterKey,
+		})
+		return err
+	}, done)
+}
+
+func (b *GRPCBookie) AddEntryAsync(ctx context.Context, ledgerID, entryID uint64, lac int64, payload, masterKey []byte, done Done) {
+	b.goRPC(ctx, func(c context.Context) error {
+		_, err := b.client.AddEntry(c, &bookiepb.AddEntryRequest{
+			LedgerId:  ledgerID,
+			EntryId:   entryID,
+			Lac:       lac,
+			Payload:   payload,
+			MasterKey: masterKey,
+		})
+		return err
+	}, done)
+}
+
+func (b *GRPCBookie) RecoveryAddEntryAsync(ctx context.Context, ledgerID, entryID uint64, lac int64, payload, masterKey []byte, done Done) {
+	b.goRPC(ctx, func(c context.Context) error {
+		_, err := b.client.RecoveryAddEntry(c, &bookiepb.RecoveryAddEntryRequest{
+			LedgerId:  ledgerID,
+			EntryId:   entryID,
+			Lac:       lac,
+			Payload:   payload,
+			MasterKey: masterKey,
+		})
+		return err
+	}, done)
+}
+
+func (b *GRPCBookie) ReadEntryAsync(ctx context.Context, ledgerID, entryID uint64, done EntryDone) {
+	go func() {
+		c, cancel := b.rpcCtx(ctx)
+		defer cancel()
+		resp, err := b.client.ReadEntry(c, &bookiepb.ReadEntryRequest{
+			LedgerId: ledgerID,
+			EntryId:  entryID,
+		})
+		if err != nil {
+			done(Entry{}, mapRPC(err))
+			return
+		}
+		done(entryFromPB(resp.Entry), nil)
+	}()
+}
+
+func (b *GRPCBookie) ReadEntriesAsync(ctx context.Context, ledgerID, fromEntryID uint64, max int, done EntriesDone) {
+	go func() {
+		c, cancel := b.rpcCtx(ctx)
+		defer cancel()
+		resp, err := b.client.ReadEntries(c, &bookiepb.ReadEntriesRequest{
+			LedgerId:    ledgerID,
+			FromEntryId: fromEntryID,
+			Max:         uint32(max),
+		})
+		if err != nil {
+			done(nil, mapRPC(err))
+			return
+		}
+		out := make([]Entry, 0, len(resp.Entries))
+		for _, e := range resp.Entries {
+			out = append(out, entryFromPB(e))
+		}
+		done(out, nil)
+	}()
+}
+
+func (b *GRPCBookie) ListEntriesAsync(ctx context.Context, ledgerID uint64, done IDsDone) {
+	go func() {
+		c, cancel := b.rpcCtx(ctx)
+		defer cancel()
+		resp, err := b.client.ListEntries(c, &bookiepb.ListEntriesRequest{LedgerId: ledgerID})
+		if err != nil {
+			done(nil, mapRPC(err))
+			return
+		}
+		done(append([]uint64(nil), resp.EntryIds...), nil)
+	}()
+}
+
+func (b *GRPCBookie) FenceLedgerAsync(ctx context.Context, ledgerID uint64, masterKey []byte, done Done) {
+	b.goRPC(ctx, func(c context.Context) error {
+		_, err := b.client.FenceLedger(c, &bookiepb.FenceLedgerRequest{
+			LedgerId:  ledgerID,
+			MasterKey: masterKey,
+		})
+		return err
+	}, done)
+}
+
+func (b *GRPCBookie) SetExplicitLACAsync(ctx context.Context, ledgerID uint64, lac int64, masterKey []byte, done Done) {
+	b.goRPC(ctx, func(c context.Context) error {
+		_, err := b.client.SetExplicitLac(c, &bookiepb.SetExplicitLacRequest{
+			LedgerId:  ledgerID,
+			Lac:       lac,
+			MasterKey: masterKey,
+		})
+		return err
+	}, done)
+}
+
+func (b *GRPCBookie) ReadLastConfirmedAsync(ctx context.Context, ledgerID uint64, done Int64Done) {
+	go func() {
+		c, cancel := b.rpcCtx(ctx)
+		defer cancel()
+		resp, err := b.client.ReadLastConfirmed(c, &bookiepb.ReadLastConfirmedRequest{LedgerId: ledgerID})
+		if err != nil {
+			done(0, mapRPC(err))
+			return
+		}
+		done(resp.Lac, nil)
+	}()
+}
+
+func (b *GRPCBookie) LastEntryIDAsync(ctx context.Context, ledgerID uint64, done Int64Done) {
+	go func() {
+		c, cancel := b.rpcCtx(ctx)
+		defer cancel()
+		resp, err := b.client.LastEntryId(c, &bookiepb.LastEntryIdRequest{LedgerId: ledgerID})
+		if err != nil {
+			done(0, mapRPC(err))
+			return
+		}
+		done(resp.EntryId, nil)
+	}()
+}
+
+func (b *GRPCBookie) IsFencedAsync(ctx context.Context, ledgerID uint64, done BoolDone) {
+	go func() {
+		c, cancel := b.rpcCtx(ctx)
+		defer cancel()
+		resp, err := b.client.IsFenced(c, &bookiepb.IsFencedRequest{LedgerId: ledgerID})
+		if err != nil {
+			done(false, mapRPC(err))
+			return
+		}
+		done(resp.Fenced, nil)
+	}()
+}
+
+func (b *GRPCBookie) DeleteLedgerAsync(ctx context.Context, ledgerID uint64, done Done) {
+	b.goRPC(ctx, func(c context.Context) error {
+		_, err := b.client.DeleteLedger(c, &bookiepb.DeleteLedgerRequest{LedgerId: ledgerID})
+		return err
+	}, done)
+}
+
+// --- Bookie sync adapter (blocks until Callback finishes) ---
+
+func (b *GRPCBookie) sync() *SyncBookie { return NewSyncBookie(b) }
+
 func (b *GRPCBookie) CreateLedger(ledgerID uint64, masterKey []byte) error {
-	ctx, cancel := b.ctx()
-	defer cancel()
-	_, err := b.client.CreateLedger(ctx, &bookiepb.CreateLedgerRequest{
-		LedgerId:  ledgerID,
-		MasterKey: masterKey,
-	})
-	return mapRPC(err)
+	return b.sync().CreateLedger(ledgerID, masterKey)
 }
 
 func (b *GRPCBookie) AddEntry(ledgerID, entryID uint64, lac int64, payload, masterKey []byte) error {
-	ctx, cancel := b.ctx()
-	defer cancel()
-	_, err := b.client.AddEntry(ctx, &bookiepb.AddEntryRequest{
-		LedgerId:  ledgerID,
-		EntryId:   entryID,
-		Lac:       lac,
-		Payload:   payload,
-		MasterKey: masterKey,
-	})
-	return mapRPC(err)
+	return b.sync().AddEntry(ledgerID, entryID, lac, payload, masterKey)
 }
 
 func (b *GRPCBookie) RecoveryAddEntry(ledgerID, entryID uint64, lac int64, payload, masterKey []byte) error {
-	ctx, cancel := b.ctx()
-	defer cancel()
-	_, err := b.client.RecoveryAddEntry(ctx, &bookiepb.RecoveryAddEntryRequest{
-		LedgerId:  ledgerID,
-		EntryId:   entryID,
-		Lac:       lac,
-		Payload:   payload,
-		MasterKey: masterKey,
-	})
-	return mapRPC(err)
+	return b.sync().RecoveryAddEntry(ledgerID, entryID, lac, payload, masterKey)
 }
 
 func (b *GRPCBookie) ReadEntry(ledgerID, entryID uint64) (Entry, error) {
-	ctx, cancel := b.ctx()
-	defer cancel()
-	resp, err := b.client.ReadEntry(ctx, &bookiepb.ReadEntryRequest{
-		LedgerId: ledgerID,
-		EntryId:  entryID,
-	})
-	if err != nil {
-		return Entry{}, mapRPC(err)
-	}
-	return entryFromPB(resp.Entry), nil
+	return b.sync().ReadEntry(ledgerID, entryID)
 }
 
 func (b *GRPCBookie) ReadEntries(ledgerID, fromEntryID uint64, max int) ([]Entry, error) {
-	ctx, cancel := b.ctx()
-	defer cancel()
-	resp, err := b.client.ReadEntries(ctx, &bookiepb.ReadEntriesRequest{
-		LedgerId:    ledgerID,
-		FromEntryId: fromEntryID,
-		Max:         uint32(max),
-	})
-	if err != nil {
-		return nil, mapRPC(err)
-	}
-	out := make([]Entry, 0, len(resp.Entries))
-	for _, e := range resp.Entries {
-		out = append(out, entryFromPB(e))
-	}
-	return out, nil
+	return b.sync().ReadEntries(ledgerID, fromEntryID, max)
 }
 
 func (b *GRPCBookie) ListEntries(ledgerID uint64) ([]uint64, error) {
-	ctx, cancel := b.ctx()
-	defer cancel()
-	resp, err := b.client.ListEntries(ctx, &bookiepb.ListEntriesRequest{LedgerId: ledgerID})
-	if err != nil {
-		return nil, mapRPC(err)
-	}
-	return append([]uint64(nil), resp.EntryIds...), nil
+	return b.sync().ListEntries(ledgerID)
 }
 
 func (b *GRPCBookie) FenceLedger(ledgerID uint64, masterKey []byte) error {
-	ctx, cancel := b.ctx()
-	defer cancel()
-	_, err := b.client.FenceLedger(ctx, &bookiepb.FenceLedgerRequest{
-		LedgerId:  ledgerID,
-		MasterKey: masterKey,
-	})
-	return mapRPC(err)
+	return b.sync().FenceLedger(ledgerID, masterKey)
 }
 
 func (b *GRPCBookie) SetExplicitLAC(ledgerID uint64, lac int64, masterKey []byte) error {
-	ctx, cancel := b.ctx()
-	defer cancel()
-	_, err := b.client.SetExplicitLac(ctx, &bookiepb.SetExplicitLacRequest{
-		LedgerId:  ledgerID,
-		Lac:       lac,
-		MasterKey: masterKey,
-	})
-	return mapRPC(err)
+	return b.sync().SetExplicitLAC(ledgerID, lac, masterKey)
 }
 
 func (b *GRPCBookie) ReadLastConfirmed(ledgerID uint64) (int64, error) {
-	ctx, cancel := b.ctx()
-	defer cancel()
-	resp, err := b.client.ReadLastConfirmed(ctx, &bookiepb.ReadLastConfirmedRequest{LedgerId: ledgerID})
-	if err != nil {
-		return 0, mapRPC(err)
-	}
-	return resp.Lac, nil
+	return b.sync().ReadLastConfirmed(ledgerID)
 }
 
 func (b *GRPCBookie) LastEntryID(ledgerID uint64) (int64, error) {
-	ctx, cancel := b.ctx()
-	defer cancel()
-	resp, err := b.client.LastEntryId(ctx, &bookiepb.LastEntryIdRequest{LedgerId: ledgerID})
-	if err != nil {
-		return 0, mapRPC(err)
-	}
-	return resp.EntryId, nil
+	return b.sync().LastEntryID(ledgerID)
 }
 
 func (b *GRPCBookie) IsFenced(ledgerID uint64) (bool, error) {
-	ctx, cancel := b.ctx()
-	defer cancel()
-	resp, err := b.client.IsFenced(ctx, &bookiepb.IsFencedRequest{LedgerId: ledgerID})
-	if err != nil {
-		return false, mapRPC(err)
-	}
-	return resp.Fenced, nil
+	return b.sync().IsFenced(ledgerID)
 }
 
 func (b *GRPCBookie) DeleteLedger(ledgerID uint64) error {
-	ctx, cancel := b.ctx()
-	defer cancel()
-	_, err := b.client.DeleteLedger(ctx, &bookiepb.DeleteLedgerRequest{LedgerId: ledgerID})
-	return mapRPC(err)
+	return b.sync().DeleteLedger(ledgerID)
 }

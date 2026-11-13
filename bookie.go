@@ -1,6 +1,8 @@
 package ledgerclient
 
-// Bookie is one open-ledger storage node.
+// Bookie is the blocking single-bookie surface (sync adapter over [BookieAsync]).
+// Prefer [BookieAsync] / GRPCBookie Async* methods on hot paths; use Bookie at
+// process edges and in-process tests.
 //
 // AddEntry and RecoveryAddEntry succeed only after that replica's journal is durable.
 // Entry ids on one bookie may have gaps. The same payload is idempotent.

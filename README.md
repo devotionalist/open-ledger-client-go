@@ -4,7 +4,7 @@ open-ledger 的 Go 客户端，和 [open-ledger-client-rust](../open-ledger-clie
 
 Bookie 只存 entry。本库负责选 write quorum、等 Qa、fence coverage、向前读修并 CAS `CLOSED`。
 
-`Bookie` 是单 bookie 传输接口。`MemoryBookie` 供测试和进程内嵌入；`GRPCBookie`（`DialBookie`）连 `openledgerd`。
+`BookieAsync` 是 Callback API（投递 + 完成回调）；`Bookie` 是阻塞适配。`MemoryBookie` 供测试；`GRPCBookie`（`DialBookie`）连 `openledgerd`，Async* 为主、同步方法为薄适配。
 
 ## Layout
 
@@ -36,11 +36,16 @@ id, err := writer.Append([]byte("hello"))
 last, err := writer.Close()
 ```
 
-## gRPC
+## gRPC (Callback API)
 
 ```go
 b0, err := ledgerclient.DialBookie(ctx, "127.0.0.1:3181")
 defer b0.Close()
+
+// Async (preferred on hot path)
+b0.AddEntryAsync(ctx, ledgerID, entryID, lac, payload, key, func(err error) { /* Finish */ })
+
+// Sync adapter (process edges / existing quorum helpers)
 bookies := map[string]ledgerclient.Bookie{"bookie-0": b0}
 ```
 
